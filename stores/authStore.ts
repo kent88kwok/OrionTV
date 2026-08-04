@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import AsyncStorage from "@react-native-async-storage/async-storage";
 import { api } from "@/services/api";
+import { LoginCredentialsManager } from "@/services/storage";
 import { useSettingsStore } from "./settingsStore";
 import Toast from "react-native-toast-message";
 import Logger from "@/utils/Logger";
@@ -59,6 +60,26 @@ const useAuthStore = create<AuthState>((set) => ({
 
       const authToken = await AsyncStorage.getItem('authCookies');
       if (!authToken) {
+        // [PATCH] 用已保存凭据静默重登录，避免每次打开都弹窗。
+        // 根因：RN/Expo 的 fetch 无法读取响应头 Set-Cookie，
+        // 因此 authCookies 永远写不进去；改为每次启动用本地已持久化的
+        // 用户名/密码重新登录（凭据本身已存于 AsyncStorage）。
+        try {
+          const creds = await LoginCredentialsManager.get();
+          if (creds && creds.password) {
+            const isLocal = serverConfig?.StorageType === "localstorage";
+            const loginResult = await api
+              .login(isLocal ? undefined : creds.username, creds.password)
+              .catch(() => null);
+            if (loginResult && loginResult.ok) {
+              set({ isLoggedIn: true, isLoginModalVisible: false });
+              return;
+            }
+          }
+        } catch {
+          // 静默登录失败则回退到弹窗
+        }
+
         if (serverConfig && serverConfig.StorageType === "localstorage") {
           const loginResult = await api.login().catch(() => {
             set({ isLoggedIn: false, isLoginModalVisible: true });
