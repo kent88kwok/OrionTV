@@ -1,4 +1,7 @@
 import AsyncStorage from "@react-native-async-storage/async-storage";
+// PR #278 的核心修复：OrionTV 已依赖 @react-native-cookies/cookies 却从未使用。
+// RN 的 fetch 没有 cookie jar，登录后必须把会话 cookie 显式回传，否则后续请求 401/500（见 issue #272）。
+import CookieManager from "@react-native-cookies/cookies";
 
 // region: --- Interface Definitions ---
 export interface DoubanItem {
@@ -88,12 +91,31 @@ export class API {
     this.baseURL = url;
   }
 
-  private async _fetch(url: string, options: RequestInit = {}): Promise<Response> {
+  private async _fetch(
+    url: string,
+    options: RequestInit & { skipAuth?: boolean } = {}
+  ): Promise<Response> {
     if (!this.baseURL) {
       throw new Error("API_URL_NOT_SET");
     }
 
-    const response = await fetch(`${this.baseURL}${url}`, options);
+    const { skipAuth, ...fetchOptions } = options;
+
+    // 关键修复：从 AsyncStorage 读取登录时保存的会话 cookie 并回传到请求头。
+    const authToken = await AsyncStorage.getItem("authCookies");
+    const headers: Record<string, string> = {
+      ...(fetchOptions.headers as Record<string, string> | undefined),
+    };
+    if (authToken && authToken.trim() && !skipAuth) {
+      headers["Cookie"] = authToken;
+    }
+
+    const response = await fetch(`${this.baseURL}${url}`, {
+      ...fetchOptions,
+      headers,
+      // 双保险：同时让原生 cookie 管理器参与（iOS/Android）
+      credentials: skipAuth ? "omit" : "include",
+    });
 
     if (response.status === 401) {
       throw new Error("UNAUTHORIZED");
@@ -111,12 +133,33 @@ export class API {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ username, password }),
+      skipAuth: true, // 登录本身不需要携带旧 cookie
     });
 
-    // 存储cookie到AsyncStorage
+    // 保存会话 cookie（兼容 RN fetch 不暴露 Set-Cookie 的情况）
     const cookies = response.headers.get("Set-Cookie");
     if (cookies) {
-      await AsyncStorage.setItem("authCookies", cookies);
+      // 只保留 name=value 片段，避免把 Path/HttpOnly 等属性当作 Cookie 值发出去
+      const clean = cookies.split(";")[0].trim();
+      await AsyncStorage.setItem("authCookies", clean);
+      try {
+        await CookieManager.setFromResponse(this.baseURL, cookies);
+      } catch {
+        // 忽略原生 cookie 管理器异常
+      }
+    } else {
+      // RN fetch 拿不到 Set-Cookie 时，退回读取原生 cookie jar
+      try {
+        const native = await CookieManager.get(this.baseURL);
+        const cookieStr = Object.values(native)
+          .map((c: any) => `${c.name}=${c.value}`)
+          .join("; ");
+        if (cookieStr) {
+          await AsyncStorage.setItem("authCookies", cookieStr);
+        }
+      } catch {
+        // 忽略
+      }
     }
 
     return response.json();
@@ -126,12 +169,18 @@ export class API {
     const response = await this._fetch("/api/logout", {
       method: "POST",
     });
-    await AsyncStorage.setItem("authCookies", '');
+    await AsyncStorage.setItem("authCookies", "");
+    try {
+      await CookieManager.clearAll();
+    } catch {
+      // 忽略
+    }
     return response.json();
   }
 
   async getServerConfig(): Promise<ServerConfig> {
-    const response = await this._fetch("/api/server-config");
+    // 未登录时也要能拿到 server-config（PR #278）
+    const response = await this._fetch("/api/server-config", { skipAuth: true });
     return response.json();
   }
 
@@ -221,7 +270,7 @@ export class API {
     const url = `/api/search/one?q=${encodeURIComponent(query)}&resourceId=${encodeURIComponent(resourceId)}`;
     const response = await this._fetch(url, { signal });
     const { results } = await response.json();
-    return { results: results.filter((item: any) => item.title === query )};
+    return { results: results.filter((item: any) => item.title === query) };
   }
 
   async getResources(signal?: AbortSignal): Promise<ApiSite[]> {
@@ -234,6 +283,22 @@ export class API {
     const url = `/api/detail?source=${source}&id=${id}`;
     const response = await this._fetch(url);
     return response.json();
+  }
+
+  /**
+   * 校验当前会话是否有效（PR #278）。
+   * 用于启动时判断是否需要重新登录：拿收藏接口试一次，401 即失效。
+   */
+  async validateSession(): Promise<boolean> {
+    try {
+      await this.getFavorites();
+      return true;
+    } catch (error) {
+      if (error instanceof Error && error.message === "UNAUTHORIZED") {
+        return false;
+      }
+      throw error;
+    }
   }
 }
 
